@@ -384,6 +384,8 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 	startTime := time.Now()
 	clientIP := request.RemoteAddr
 	method := request.Method
+	audit := newAuditRecord(request, startTime) // [wasl] 호출 1건당 Audit 로그 한 줄
+	defer audit.emit()
 	requestURL := request.URL.String()
 	userAgent := request.Header.Get("User-Agent")
 
@@ -409,6 +411,7 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 	origin := request.Header.Get("Origin")
 	if origin == "" || !isAllowedOrigin(origin) {
 		atomic.AddUint64(&totalErrors, 1)
+		audit.result = "denied_origin"
 		if strings.HasPrefix(request.Header.Get("Content-Type"), "application/json") {
 			response.Header().Add("Access-Control-Allow-Headers", "*")
 			response.Header().Add("Access-Control-Allow-Origin", "*")
@@ -508,11 +511,13 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 	}
 
 	// Log the proxied request details with sanitized input
-	InfoLogger.Printf("Proxying %s request from %s to %s", sanitizeLogInput(requestData.Method), clientIP, sanitizeLogInput(requestData.Url))
+	InfoLogger.Printf("Proxying %s request from %s to %s", sanitizeLogInput(requestData.Method), clientIP, logURL(requestData.Url))
+	audit.method, audit.target = requestData.Method, requestData.Url
 
 	if len(accessToken) > 0 && requestData.AccessToken != accessToken {
 		atomic.AddUint64(&totalErrors, 1)
 		ErrorLogger.Printf("Unauthorized request from %s: Invalid access token", clientIP)
+		audit.result = "denied_token"
 		_, err := fmt.Fprintln(response, "{\"success\": false, \"data\":{\"message\":\"(Proxy Error) Unauthorized request; you may need to set your access token in Settings.\"}}")
 		if err != nil {
 			ErrorLogger.Printf("Failed to write unauthorized error: %v", err)
@@ -559,8 +564,9 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 
 	proxyRequest.URL = parsedURL
 
-	if !isAllowedDest(proxyRequest.URL.Hostname()) {
+	if !isAllowedDest(proxyRequest.URL.Hostname()) || isLoopbackTarget(proxyRequest.URL.Hostname()) {
 		atomic.AddUint64(&totalErrors, 1)
+		audit.result = "denied_destination"
 		ErrorLogger.Printf("Request to banned destination %s from %s", proxyRequest.URL.Hostname(), clientIP)
 		_, err := fmt.Fprintln(response, "{\"success\": false, \"data\":{\"message\":\"(Proxy Error) Request cannot be to this destination.\"}}")
 		if err != nil {
@@ -574,10 +580,11 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 		params.Set(k, v)
 	}
 	proxyRequest.URL.RawQuery = params.Encode()
+	audit.target = proxyRequest.URL.String()
 
 	if len(requestData.Auth.Username) > 0 && len(requestData.Auth.Password) > 0 {
 		proxyRequest.SetBasicAuth(requestData.Auth.Username, requestData.Auth.Password)
-		DebugLogger.Printf("Using basic auth for request to %s", sanitizeLogInput(proxyRequest.URL.String()))
+		DebugLogger.Printf("Using basic auth for request to %s", logURL(proxyRequest.URL.String()))
 	}
 
 	for k, v := range requestData.Headers {
@@ -667,13 +674,14 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 		Timeout: 30 * time.Second,
 	}
 
-	DebugLogger.Printf("Sending proxied request to %s", sanitizeLogInput(proxyRequest.URL.String()))
+	DebugLogger.Printf("Sending proxied request to %s", logURL(proxyRequest.URL.String()))
 	proxyStartTime := time.Now()
 
 	proxyResponse, err := client.Do(&proxyRequest)
 	if err != nil {
 		atomic.AddUint64(&totalErrors, 1)
-		ErrorLogger.Printf("Failed to execute proxied request to %s: %v", sanitizeLogInput(proxyRequest.URL.String()), err)
+		ErrorLogger.Printf("Failed to execute proxied request to %s: %v", logURL(proxyRequest.URL.String()), logErr(err))
+		audit.result = "upstream_error"
 		_, writeErr := fmt.Fprintln(response, "{\"success\": false, \"data\":{\"message\":\"(Proxy Error) Request failed: "+err.Error()+"\"}}")
 		if writeErr != nil {
 			ErrorLogger.Printf("Failed to write error response: %v", writeErr)
@@ -688,7 +696,8 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 		}
 	}(proxyResponse.Body)
 
-	InfoLogger.Printf("Received response from %s with status %d in %v", sanitizeLogInput(proxyRequest.URL.String()), proxyResponse.StatusCode, time.Since(proxyStartTime))
+	InfoLogger.Printf("Received response from %s with status %d in %v", logURL(proxyRequest.URL.String()), proxyResponse.StatusCode, time.Since(proxyStartTime))
+	audit.result, audit.status = "response_error", proxyResponse.StatusCode
 
 	var responseData Response
 	responseData.Success = true
@@ -707,6 +716,7 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 	}
 
 	responseData.Headers = headerToArray(proxyResponse.Header)
+	audit.result, audit.bytes = "ok", len(responseBytes)
 
 	if requestData.WantsBinary {
 		for _, bannedOutput := range bannedOutputs {
@@ -735,7 +745,7 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 	}
 
 	// Log completion with sanitized user input
-	InfoLogger.Printf("Completed %s request from %s to %s in %v", sanitizeLogInput(requestData.Method), clientIP, sanitizeLogInput(requestData.Url), time.Since(startTime))
+	InfoLogger.Printf("Completed %s request from %s to %s in %v", sanitizeLogInput(requestData.Method), clientIP, logURL(requestData.Url), time.Since(startTime))
 }
 
 // EnableHealthCheck turns on or off the health check functionality
