@@ -4,8 +4,7 @@ package libproxy
 //
 // proxyHandler 가 POST(프록시 요청)를 받을 때마다 결과와 상관없이 stdout 에 JSON 한 줄을 쓴다.
 // 사용자는 앞단 프록시가 넘기는 X-Forwarded-Email / X-Forwarded-User(oauth2-proxy 가 세운 값)에서 읽는다.
-// Authorization · Cookie · 요청 / 응답 본문은 기록하지 않고, URL 의 userinfo 와 민감한 쿼리 값은 가린다. URL 경로 · 쿼리 값의
-// 이메일 · 휴대폰 번호와 신분번호 쿼리 값은 일부만 가린다(pii.go).
+// Authorization · Cookie · 요청 / 응답 본문은 기록하지 않고, URL 의 userinfo 와 민감한 쿼리 값은 가린다.
 // 업스트림 텍스트 로그(Proxying / Received response / Completed 등)의 URL 도 같은 규칙으로 가린다(logURL · logErr).
 
 import (
@@ -114,7 +113,6 @@ func isSensitiveQueryKey(k string) bool {
 }
 
 // maskAuditURL 은 기록용 URL 과 호스트를 돌려준다. userinfo 는 통째로 지우고 민감한 쿼리 값은 *** 로 바꾼다.
-// 경로와 남은 쿼리 값의 이메일 · 휴대폰 번호는 일부만 가리고, 신분번호 쿼리 값은 앞 한 글자만 남긴다(pii.go).
 // 파싱하지 못하면 쿼리를 통째로 버린다(값을 남기지 않는 쪽으로 실패).
 func maskAuditURL(raw string) (string, string) {
 	if raw == "" {
@@ -125,27 +123,16 @@ func maskAuditURL(raw string) (string, string) {
 		if i := strings.IndexAny(raw, "?#"); i >= 0 {
 			raw = raw[:i]
 		}
-		return sanitizeLogInput(maskPII(raw)), ""
+		return sanitizeLogInput(raw), ""
 	}
 	u.User = nil
 	u.Fragment = ""
-	if p := maskPII(u.Path); p != u.Path {
-		// 디코딩된 경로에서 가렸으니 다시 인코딩한다. * 는 경로에 그대로 둘 수 있는 문자라 %2A 로 바꾸지 않는다 -
-		// 이 경로가 Slack 알림에 그대로 보인다(monitoring/files/alerts/hoppscotch.yaml 의 target)
-		u.Path = p
-		u.RawPath = strings.ReplaceAll((&url.URL{Path: p}).EscapedPath(), "%2A", "*")
-	}
 	if u.RawQuery != "" {
 		q := u.Query()
 		for k, vs := range q {
-			for i := range vs {
-				switch {
-				case isSensitiveQueryKey(k):
+			if isSensitiveQueryKey(k) {
+				for i := range vs {
 					vs[i] = "***"
-				case isPIIIDQueryKey(k):
-					vs[i] = maskIDValue(vs[i])
-				default:
-					vs[i] = maskPII(vs[i])
 				}
 			}
 		}
