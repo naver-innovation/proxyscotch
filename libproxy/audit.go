@@ -4,6 +4,7 @@ package libproxy
 //
 // proxyHandler 가 POST(프록시 요청)를 받을 때마다 결과와 상관없이 stdout 에 JSON 한 줄을 쓴다.
 // 사용자는 앞단 프록시가 넘기는 X-Forwarded-Email / X-Forwarded-User(oauth2-proxy 가 세운 값)에서 읽는다.
+// CLI · CI 경로(/cli)만은 헤더 대신 Hoppscotch PAT 의 주인을 쓴다(pat.go).
 // Authorization · Cookie · 요청 / 응답 본문은 기록하지 않고, URL 의 userinfo 와 민감한 쿼리 값은 가린다.
 // 업스트림 텍스트 로그(Proxying / Received response / Completed 등)의 URL 도 같은 규칙으로 가린다(logURL · logErr).
 //
@@ -79,7 +80,7 @@ type siemLine struct {
 }
 
 func newAuditRecord(r *http.Request, start time.Time) *auditRecord {
-	return &auditRecord{
+	a := &auditRecord{
 		skip:   r.Method != http.MethodPost || r.URL.Path == "/health" || r.URL.Path == "/metrics",
 		start:  start,
 		user:   r.Header.Get("X-Forwarded-Email"),
@@ -88,6 +89,11 @@ func newAuditRecord(r *http.Request, start time.Time) *auditRecord {
 		src:    siemSource(r.URL.Query().Get("hopp_src")),
 		result: "rejected",
 	}
+	// CLI · CI 경로의 사용자는 PAT 주인이다(pat.go). 확인 전까지는 anonymous 이고, 요청 헤더의 사용자는 쓰지 않는다
+	if r.URL.Path == cliPath {
+		a.user, a.userID = patAnonymousUser, ""
+	}
+	return a
 }
 
 func (a *auditRecord) emit() {

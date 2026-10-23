@@ -238,6 +238,7 @@ func Initialize(
 
 	accessToken = initialAccessToken
 	sessionFingerprint = uuid.New().String()
+	initPATFromEnv() // [wasl] CLI · CI 경로의 PAT 확인 (pat.go)
 
 	InfoLogger.Println("Starting proxy server...")
 	InfoLogger.Printf("Allowed origins: %v", allowedOrigins)
@@ -514,7 +515,19 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 	InfoLogger.Printf("Proxying %s request from %s to %s", sanitizeLogInput(requestData.Method), clientIP, logURL(requestData.Url))
 	audit.method, audit.target = requestData.Method, requestData.Url
 
-	if len(accessToken) > 0 && requestData.AccessToken != accessToken {
+	// [wasl] CLI · CI 경로는 공용 토큰 대신 Hoppscotch PAT 로 인증한다 (pat.go)
+	if request.URL.Path == cliPath {
+		if result := checkPAT(request.Context(), audit, requestData.AccessToken); result != "" {
+			atomic.AddUint64(&totalErrors, 1)
+			ErrorLogger.Printf("Unauthorized CLI request from %s: %s", clientIP, result)
+			audit.result = result
+			_, err := fmt.Fprintln(response, patDeniedBody(result))
+			if err != nil {
+				ErrorLogger.Printf("Failed to write unauthorized error: %v", err)
+			}
+			return
+		}
+	} else if len(accessToken) > 0 && requestData.AccessToken != accessToken {
 		atomic.AddUint64(&totalErrors, 1)
 		ErrorLogger.Printf("Unauthorized request from %s: Invalid access token", clientIP)
 		audit.result = "denied_token"
