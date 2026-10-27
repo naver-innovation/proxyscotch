@@ -9,7 +9,8 @@ package libproxy
 //     Hoppscotch 는 PAT 를 평문으로 저장하므로, 테이블을 읽을 수 있는 role 이면 모든 PAT 를 읽을 수 있다.
 //     함수는 (pat_id, owner_email, expires_on, created_on, owner_verified) 한 행을 돌려주고, 없으면 행이 없다.
 //   - 만료가 없는 PAT, 발급부터 만료까지가 PROXYSCOTCH_PAT_MAX_DAYS 를 넘는 PAT, 만료된 PAT, 함수가 owner_verified=false 로
-//     돌려준 PAT 는 거부한다.
+//     돌려준 PAT 는 거부한다. 만료가 없는 PAT 는 주인 이메일이 PROXYSCOTCH_PAT_NO_EXPIRY_OWNERS(쉼표로 구분, 대소문자 무시)에
+//     있을 때만 받는다 - 사람이 주기적으로 다시 발급하기 어려운 CI 용 계정을 위한 예외다.
 //   - 조회 결과는 PAT 의 SHA-256 으로 짧게 캐시한다(찾음 30초, 없음 10초). 조회 오류는 캐시하지 않고 거부한다(닫힌 실패).
 //   - 출발지(hopp_src)마다 1분에 PROXYSCOTCH_PAT_FAIL_PER_MINUTE 번 넘게 없는 PAT 를 보내면 그 분이 끝날 때까지 조회 없이 거부한다.
 //   - Audit · SIEM 줄의 user 는 PAT 주인 이메일, user_id 는 pat:<PAT id> 다. 주인을 모르면 user 는 anonymous 다.
@@ -21,9 +22,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,7 +65,25 @@ var (
 	patNow       = time.Now
 	patCache     = newPATCache()
 	patFails     = newPATFailCounter()
+	// 만료가 없는 PAT 를 받는 주인(소문자 이메일). 비어 있으면 만료가 없는 PAT 는 모두 거부한다.
+	patNoExpiryOwners = map[string]bool{}
 )
+
+// parsePATOwners 는 쉼표로 구분한 이메일 목록을 소문자 집합으로 바꾼다. 빈 항목은 건너뛰고, @ 가 없는 항목은 오류다.
+func parsePATOwners(v string) (map[string]bool, error) {
+	owners := map[string]bool{}
+	for _, e := range strings.Split(v, ",") {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" {
+			continue
+		}
+		if !strings.Contains(e, "@") {
+			return nil, fmt.Errorf("%q is not an email address", e)
+		}
+		owners[e] = true
+	}
+	return owners, nil
+}
 
 // initPATFromEnv 는 PROXYSCOTCH_PAT_DSN 이 있을 때만 CLI 경로를 켠다. 값이 잘못됐으면 기동을 멈춘다(조용히 꺼진 채로 뜨지 않게).
 // DSN 에는 비밀번호를 넣지 않는다 - 드라이버가 PGPASSWORD 를 읽는다.
@@ -85,6 +106,11 @@ func initPATFromEnv() {
 		}
 		patFailLimit = n
 	}
+	owners, err := parsePATOwners(os.Getenv("PROXYSCOTCH_PAT_NO_EXPIRY_OWNERS"))
+	if err != nil {
+		ErrorLogger.Fatalf("PROXYSCOTCH_PAT_NO_EXPIRY_OWNERS: %s", sanitizeLogInput(err.Error()))
+	}
+	patNoExpiryOwners = owners
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		ErrorLogger.Fatalf("PROXYSCOTCH_PAT_DSN is invalid: %v", err)
@@ -94,8 +120,8 @@ func initPATFromEnv() {
 	db.SetMaxIdleConns(2)
 	db.SetConnMaxLifetime(10 * time.Minute)
 	patLookup = sqlPATLookup(db)
-	InfoLogger.Printf("CLI path %s enabled: Hoppscotch PAT up to %d days, %d unknown tokens per source per minute",
-		cliPath, int(patMaxAge/(24*time.Hour)), patFailLimit)
+	InfoLogger.Printf("CLI path %s enabled: Hoppscotch PAT up to %d days (%d owners may use PATs without expiry), %d unknown tokens per source per minute",
+		cliPath, int(patMaxAge/(24*time.Hour)), len(patNoExpiryOwners), patFailLimit)
 }
 
 func sqlPATLookup(db *sql.DB) patLookupFunc {
@@ -163,7 +189,9 @@ func checkPAT(ctx context.Context, a *auditRecord, token string) string {
 		a.user = patAnonymousUser
 		return "denied_pat_owner"
 	case owner.ExpiresOn == nil:
-		return "denied_pat_no_expiry"
+		if !patNoExpiryOwners[strings.ToLower(owner.Email)] {
+			return "denied_pat_no_expiry"
+		}
 	case !now.Before(*owner.ExpiresOn):
 		return "denied_pat_expired"
 	case owner.ExpiresOn.Sub(owner.CreatedOn) > patMaxAge+patLifetimeSlack:

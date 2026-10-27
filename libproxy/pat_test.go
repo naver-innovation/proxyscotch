@@ -33,6 +33,7 @@ func (f *fakePATs) lookup(_ context.Context, uuid string) (*patOwner, error) {
 func withPAT(t *testing.T, f *fakePATs, now time.Time) *time.Time {
 	t.Helper()
 	oldLookup, oldNow, oldCache, oldFails, oldLimit, oldMax := patLookup, patNow, patCache, patFails, patFailLimit, patMaxAge
+	oldNoExpiry := patNoExpiryOwners
 	clock := now
 	patNow = func() time.Time { return clock }
 	if f != nil {
@@ -41,8 +42,10 @@ func withPAT(t *testing.T, f *fakePATs, now time.Time) *time.Time {
 		patLookup = nil
 	}
 	patCache, patFails, patFailLimit, patMaxAge = newPATCache(), newPATFailCounter(), 10, 90*24*time.Hour
+	patNoExpiryOwners = map[string]bool{}
 	t.Cleanup(func() {
 		patLookup, patNow, patCache, patFails, patFailLimit, patMaxAge = oldLookup, oldNow, oldCache, oldFails, oldLimit, oldMax
+		patNoExpiryOwners = oldNoExpiry
 	})
 	return &clock
 }
@@ -134,6 +137,47 @@ func TestCLIOwnerChecks(t *testing.T) {
 			t.Errorf("90-day PAT: %v", a["result"])
 		}
 	})
+}
+
+// PROXYSCOTCH_PAT_NO_EXPIRY_OWNERS 에 있는 주인만 만료가 없는 PAT 를 쓸 수 있다. 다른 검사(주인 확인 · 만료)는 그대로다.
+func TestCLINoExpiryOwners(t *testing.T) {
+	now := time.Now()
+	past := now.Add(-time.Minute)
+	cases := []struct {
+		name, result string
+		owner        *patOwner
+	}{
+		{"listed owner, no expiry", "ok", &patOwner{ID: "p", Email: "CI-Bot@Example.com", CreatedOn: now, Verified: true}},
+		{"other owner, no expiry", "denied_pat_no_expiry", &patOwner{ID: "p", Email: "dev@example.com", CreatedOn: now, Verified: true}},
+		{"listed owner, expired", "denied_pat_expired", &patOwner{ID: "p", Email: "ci-bot@example.com", ExpiresOn: &past, CreatedOn: now.Add(-48 * time.Hour), Verified: true}},
+		{"listed owner, not verified", "denied_pat_owner", &patOwner{ID: "p", Email: "ci-bot@example.com", CreatedOn: now, Verified: false}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("PROXYSCOTCH_ALLOW_LOOPBACK_TARGETS", "true")
+			withPAT(t, &fakePATs{owners: map[string]*patOwner{strings.TrimPrefix(testPATGood, "pat-"): c.owner}}, now)
+			owners, err := parsePATOwners(" ci-bot@example.com , ,other@example.com")
+			if err != nil {
+				t.Fatal(err)
+			}
+			patNoExpiryOwners = owners
+			if a := cliCall(t, testPATGood, "10.0.0.9", nil); a["result"] != c.result {
+				t.Errorf("result=%v, want %s", a["result"], c.result)
+			}
+		})
+	}
+}
+
+func TestParsePATOwners(t *testing.T) {
+	if o, err := parsePATOwners(""); err != nil || len(o) != 0 {
+		t.Errorf("empty: %v %v", o, err)
+	}
+	if o, err := parsePATOwners("A@x.com,b@y.com"); err != nil || !o["a@x.com"] || !o["b@y.com"] || len(o) != 2 {
+		t.Errorf("list: %v %v", o, err)
+	}
+	if _, err := parsePATOwners("a@x.com,not-an-email"); err == nil {
+		t.Error("want an error for an entry without @")
+	}
 }
 
 func TestCLIMalformedAndUnknown(t *testing.T) {
