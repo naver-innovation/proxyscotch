@@ -116,6 +116,21 @@ func TestAuditSkipsNonProxyRequests(t *testing.T) {
 	}
 }
 
+func TestSIEMLineSkipsNonProxyRequests(t *testing.T) {
+	var buf bytes.Buffer
+	old, oldSIEM := auditOut, siemOut
+	auditOut, siemOut = log.New(io.Discard, "", 0), log.New(&buf, "", 0)
+	defer func() { auditOut, siemOut = old, oldSIEM }()
+	for _, c := range [][2]string{{"GET", "/"}, {"OPTIONS", "/"}, {"GET", "/health"}} {
+		r := httptest.NewRequest(c[0], c[1], strings.NewReader("{}"))
+		r.Header.Set("Origin", "validorigin1.com")
+		proxyHandler(httptest.NewRecorder(), r)
+		if buf.Len() != 0 {
+			t.Errorf("%s %s should not write a siem line: %q", c[0], c[1], buf.String())
+		}
+	}
+}
+
 func TestUpstreamLogLinesMasked(t *testing.T) {
 	t.Setenv("PROXYSCOTCH_ALLOW_LOOPBACK_TARGETS", "true") // 대상이 127.0.0.1 이다
 	var buf bytes.Buffer
@@ -222,13 +237,16 @@ func TestSIEMLineForReadCall(t *testing.T) {
 
 func TestSIEMLineUpstreamStatus(t *testing.T) {
 	t.Setenv("PROXYSCOTCH_ALLOW_LOOPBACK_TARGETS", "true")
-	for status, want := range map[string]string{"201": "success", "302": "success", "401": "denied", "403": "denied", "404": "error", "500": "error"} {
-		l := siemCall(t, Request{Url: testServerUrl + "/status/" + status, Method: "DELETE"}, "validorigin1.com", nil, "/?hopp_rid=r1")
-		if len(l) != 1 {
-			t.Fatalf("status %s: want 1 siem line, got %v", status, l)
-		}
-		if m := siemFields(t, l[0]); m["result"] != want || m["action"] != "api.delete" {
-			t.Errorf("status %s: result %q action %q, want %q api.delete", status, m["result"], m["action"], want)
+	for _, method := range []string{"GET", "DELETE"} {
+		action := "api." + strings.ToLower(method)
+		for status, want := range map[string]string{"201": "success", "302": "success", "401": "denied", "403": "denied", "404": "error", "500": "error"} {
+			l := siemCall(t, Request{Url: testServerUrl + "/status/" + status, Method: method}, "validorigin1.com", nil, "/?hopp_rid=r1")
+			if len(l) != 1 {
+				t.Fatalf("%s status %s: want 1 siem line, got %v", method, status, l)
+			}
+			if m := siemFields(t, l[0]); m["result"] != want || m["action"] != action {
+				t.Errorf("%s status %s: result %q action %q, want %q %s", method, status, m["result"], m["action"], want, action)
+			}
 		}
 	}
 }
