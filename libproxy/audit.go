@@ -9,7 +9,7 @@ package libproxy
 // 업스트림 텍스트 로그(Proxying / Received response / Completed 등)의 URL 도 같은 규칙으로 가린다(logURL · logErr).
 //
 // 호출마다 감사 수집용 줄을 한 줄 더 쓴다(siemLine, 첫 키 siem_audit). 위 Audit 줄은 그대로 두고 따로 쓴다.
-//   - 조회(GET · HEAD · OPTIONS · TRACE)도 쓴다. 대량 조회 · 거부 급증 같은 데이터 추출 탐지에 쓴다.
+//   - 대상 method 가 조회(GET · HEAD · OPTIONS · TRACE)여도 쓴다 - 대량 조회 · 거부 급증 탐지용이다.
 //   - action 은 api.<method 소문자>(method 를 모르면 api.call), result 는 success · denied · error 로 맞춘다.
 //     프록시 전달에 성공해도 대상이 401 · 403 을 주면 denied, 그 밖의 4xx · 5xx 는 error 다.
 //   - target 은 대상 호스트와 앞단 프록시의 요청 ID(hopp_rid) - 경로 · 쿼리는 토큰이 남을 수 있어 쓰지 않는다.
