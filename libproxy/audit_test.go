@@ -206,11 +206,16 @@ func TestSIEMLineForWriteCall(t *testing.T) {
 	}
 }
 
-func TestSIEMLineSkipsReads(t *testing.T) {
+func TestSIEMLineForReadCall(t *testing.T) {
 	t.Setenv("PROXYSCOTCH_ALLOW_LOOPBACK_TARGETS", "true")
-	for _, method := range []string{"GET", "get", "HEAD", "OPTIONS", "TRACE"} {
-		if l := siemCall(t, Request{Url: testServerUrl + "/get", Method: method}, "validorigin1.com", nil, "/?hopp_rid=r1"); len(l) != 0 {
-			t.Errorf("%s should not write a siem line: %v", method, l)
+	for method, want := range map[string]string{"GET": "api.get", "get": "api.get", "HEAD": "api.head", "OPTIONS": "api.options", "TRACE": "api.trace"} {
+		l := siemCall(t, Request{Url: testServerUrl + "/anything", Method: method}, "validorigin1.com",
+			map[string]string{"X-Forwarded-Email": "dev@example.com"}, "/?hopp_rid=r1")
+		if len(l) != 1 {
+			t.Fatalf("%s: want 1 siem line, got %v", method, l)
+		}
+		if m := siemFields(t, l[0]); m["action"] != want || m["user"] != "dev@example.com" || m["target"] != "127.0.0.1 rid=r1" || m["result"] != "success" {
+			t.Errorf("%s: %v, want action %q", method, m, want)
 		}
 	}
 }
@@ -262,8 +267,8 @@ func TestSIEMLineRejections(t *testing.T) {
 func TestSIEMActionSanitized(t *testing.T) {
 	for method, want := range map[string]string{"": "api.call", "Custom": "api.custom", "PROP-FIND": "api.prop-find",
 		"X Y": "api.other", `POST"}`: "api.other", strings.Repeat("A", 30): "api.other"} {
-		if got, ok := siemAction(method); !ok || got != want {
-			t.Errorf("siemAction(%q) = %q %v, want %q", method, got, ok, want)
+		if got := siemAction(method); got != want {
+			t.Errorf("siemAction(%q) = %q, want %q", method, got, want)
 		}
 	}
 	if got := siemTarget("h", `r1" x`); got != "h" {
