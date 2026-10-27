@@ -109,9 +109,17 @@ func TestAuditRejections(t *testing.T) {
 }
 
 func TestAuditSkipsNonProxyRequests(t *testing.T) {
-	for _, c := range [][2]string{{"GET", "/"}, {"OPTIONS", "/"}, {"GET", "/health"}} {
+	for _, c := range [][2]string{{"GET", "/"}, {"OPTIONS", "/"}, {"POST", "/health"}, {"POST", "/metrics"}} {
 		if l := auditCall(t, Request{}, "validorigin1.com", nil, c[0], c[1]); len(l) != 0 {
 			t.Errorf("%s %s should not be audited: %v", c[0], c[1], l)
+		}
+	}
+}
+
+func TestSIEMLineSkipsNonProxyRequests(t *testing.T) {
+	for _, c := range [][2]string{{"GET", "/"}, {"OPTIONS", "/"}, {"POST", "/health"}, {"POST", "/metrics"}} {
+		if l := siemCallMethod(t, Request{}, "validorigin1.com", nil, c[0], c[1]); len(l) != 0 {
+			t.Errorf("%s %s should not write a siem line: %v", c[0], c[1], l)
 		}
 	}
 }
@@ -143,12 +151,18 @@ func TestUpstreamLogLinesMasked(t *testing.T) {
 // siemCall 은 한 호출이 쓴 감사 수집용 줄(siem_audit)을 원문 그대로 돌려준다.
 func siemCall(t *testing.T, req Request, origin string, hdr map[string]string, path string) []string {
 	t.Helper()
+	return siemCallMethod(t, req, origin, hdr, "POST", path)
+}
+
+// siemCallMethod 는 siemCall 과 같고, 프록시로 보내는 method 를 고른다.
+func siemCallMethod(t *testing.T, req Request, origin string, hdr map[string]string, method, path string) []string {
+	t.Helper()
 	var buf bytes.Buffer
 	old, oldSIEM := auditOut, siemOut
 	auditOut, siemOut = log.New(io.Discard, "", 0), log.New(&buf, "", 0)
 	defer func() { auditOut, siemOut = old, oldSIEM }()
 	body, _ := json.Marshal(req)
-	r := httptest.NewRequest("POST", path, bytes.NewReader(body))
+	r := httptest.NewRequest(method, path, bytes.NewReader(body))
 	if origin != "" {
 		r.Header.Set("Origin", origin)
 	}
@@ -206,24 +220,35 @@ func TestSIEMLineForWriteCall(t *testing.T) {
 	}
 }
 
-func TestSIEMLineSkipsReads(t *testing.T) {
+func TestSIEMLineForReadCall(t *testing.T) {
 	t.Setenv("PROXYSCOTCH_ALLOW_LOOPBACK_TARGETS", "true")
-	for _, method := range []string{"GET", "get", "HEAD", "OPTIONS", "TRACE"} {
-		if l := siemCall(t, Request{Url: testServerUrl + "/get", Method: method}, "validorigin1.com", nil, "/?hopp_rid=r1"); len(l) != 0 {
-			t.Errorf("%s should not write a siem line: %v", method, l)
+	for method, action := range map[string]string{"GET": "api.get", "get": "api.get", "HEAD": "api.head", "OPTIONS": "api.options", "TRACE": "api.trace"} {
+		l := siemCall(t, Request{Url: testServerUrl + "/anything", Method: method}, "validorigin1.com",
+			map[string]string{"X-Forwarded-Email": "dev@example.com"}, "/?hopp_rid=r1")
+		if len(l) != 1 {
+			t.Fatalf("%s: want 1 siem line, got %v", method, l)
+		}
+		m := siemFields(t, l[0])
+		for k, want := range map[string]string{"action": action, "user": "dev@example.com", "target": "127.0.0.1 rid=r1", "result": "success"} {
+			if m[k] != want {
+				t.Errorf("%s: %s = %q, want %q", method, k, m[k], want)
+			}
 		}
 	}
 }
 
 func TestSIEMLineUpstreamStatus(t *testing.T) {
 	t.Setenv("PROXYSCOTCH_ALLOW_LOOPBACK_TARGETS", "true")
-	for status, want := range map[string]string{"201": "success", "302": "success", "401": "denied", "403": "denied", "404": "error", "500": "error"} {
-		l := siemCall(t, Request{Url: testServerUrl + "/status/" + status, Method: "DELETE"}, "validorigin1.com", nil, "/?hopp_rid=r1")
-		if len(l) != 1 {
-			t.Fatalf("status %s: want 1 siem line, got %v", status, l)
-		}
-		if m := siemFields(t, l[0]); m["result"] != want || m["action"] != "api.delete" {
-			t.Errorf("status %s: result %q action %q, want %q api.delete", status, m["result"], m["action"], want)
+	for _, method := range []string{"GET", "DELETE"} {
+		action := "api." + strings.ToLower(method)
+		for status, want := range map[string]string{"201": "success", "304": "success", "401": "denied", "403": "denied", "404": "error", "500": "error"} {
+			l := siemCall(t, Request{Url: testServerUrl + "/status/" + status, Method: method}, "validorigin1.com", nil, "/?hopp_rid=r1")
+			if len(l) != 1 {
+				t.Fatalf("%s status %s: want 1 siem line, got %v", method, status, l)
+			}
+			if m := siemFields(t, l[0]); m["result"] != want || m["action"] != action {
+				t.Errorf("%s status %s: result %q action %q, want %q %s", method, status, m["result"], m["action"], want, action)
+			}
 		}
 	}
 }
@@ -262,8 +287,8 @@ func TestSIEMLineRejections(t *testing.T) {
 func TestSIEMActionSanitized(t *testing.T) {
 	for method, want := range map[string]string{"": "api.call", "Custom": "api.custom", "PROP-FIND": "api.prop-find",
 		"X Y": "api.other", `POST"}`: "api.other", strings.Repeat("A", 30): "api.other"} {
-		if got, ok := siemAction(method); !ok || got != want {
-			t.Errorf("siemAction(%q) = %q %v, want %q", method, got, ok, want)
+		if got := siemAction(method); got != want {
+			t.Errorf("siemAction(%q) = %q, want %q", method, got, want)
 		}
 	}
 	if got := siemTarget("h", `r1" x`); got != "h" {

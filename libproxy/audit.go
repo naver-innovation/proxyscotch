@@ -8,8 +8,8 @@ package libproxy
 // Authorization · Cookie · 요청 / 응답 본문은 기록하지 않고, URL 의 userinfo 와 민감한 쿼리 값은 가린다.
 // 업스트림 텍스트 로그(Proxying / Received response / Completed 등)의 URL 도 같은 규칙으로 가린다(logURL · logErr).
 //
-// 같은 호출이 변경 호출이면 감사 수집용 줄을 한 줄 더 쓴다(siemLine, 첫 키 siem_audit). 위 Audit 줄은 그대로 두고 따로 쓴다.
-//   - 대상 method 가 GET · HEAD · OPTIONS · TRACE 인 조회는 쓰지 않는다. 본문을 읽기 전에 거부돼 method 를 모르는 호출은 쓴다.
+// 호출마다 감사 수집용 줄을 한 줄 더 쓴다(siemLine, 첫 키 siem_audit). 위 Audit 줄은 그대로 두고 따로 쓴다.
+//   - 대상 method 가 조회(GET · HEAD · OPTIONS · TRACE)여도 쓴다 - 대량 조회 · 거부 급증 탐지용이다.
 //   - action 은 api.<method 소문자>(method 를 모르면 api.call), result 는 success · denied · error 로 맞춘다.
 //     프록시 전달에 성공해도 대상이 401 · 403 을 주면 denied, 그 밖의 4xx · 5xx 는 error 다.
 //   - target 은 대상 호스트와 앞단 프록시의 요청 ID(hopp_rid) - 경로 · 쿼리는 토큰이 남을 수 있어 쓰지 않는다.
@@ -33,9 +33,8 @@ var (
 	auditOut = log.New(os.Stdout, "", 0)
 	siemOut  = log.New(os.Stdout, "", 0)
 
-	siemReadMethods = map[string]bool{"GET": true, "HEAD": true, "OPTIONS": true, "TRACE": true}
-	siemMethodName  = regexp.MustCompile(`^[A-Z][A-Z0-9_-]{0,19}$`)
-	siemRequestID   = regexp.MustCompile(`^[0-9A-Za-z-]{1,64}$`)
+	siemMethodName = regexp.MustCompile(`^[A-Z][A-Z0-9_-]{0,19}$`)
+	siemRequestID  = regexp.MustCompile(`^[0-9A-Za-z-]{1,64}$`)
 )
 
 type auditRecord struct {
@@ -122,15 +121,11 @@ func (a *auditRecord) emit() {
 	}
 	auditOut.Println(string(line))
 
-	action, ok := siemAction(a.method)
-	if !ok {
-		return
-	}
 	siem, err := json.Marshal(siemLine{
 		SIEMAudit: "v1",
 		Time:      a.start.UTC().Format(time.RFC3339Nano),
 		User:      a.user,
-		Action:    action,
+		Action:    siemAction(a.method),
 		Target:    siemTarget(host, a.rid),
 		Result:    siemResult(a.result, a.status),
 		Src:       a.src,
@@ -142,19 +137,17 @@ func (a *auditRecord) emit() {
 	siemOut.Println(string(siem))
 }
 
-// siemAction 은 대상 method 를 action 으로 바꾼다. 조회 method 면 false(쓰지 않는다)다.
+// siemAction 은 대상 method 를 action 으로 바꾼다.
 // method 는 클라이언트가 보낸 값이라 이름 꼴이 아니면 api.other 로 묶는다.
-func siemAction(method string) (string, bool) {
+func siemAction(method string) string {
 	m := strings.ToUpper(strings.TrimSpace(method))
 	switch {
 	case m == "":
-		return "api.call", true
-	case siemReadMethods[m]:
-		return "", false
+		return "api.call"
 	case !siemMethodName.MatchString(m):
-		return "api.other", true
+		return "api.other"
 	default:
-		return "api." + strings.ToLower(m), true
+		return "api." + strings.ToLower(m)
 	}
 }
 
