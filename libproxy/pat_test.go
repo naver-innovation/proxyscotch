@@ -5,6 +5,7 @@ package libproxy
 import (
 	"context"
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -33,7 +34,7 @@ func (f *fakePATs) lookup(_ context.Context, uuid string) (*patOwner, error) {
 func withPAT(t *testing.T, f *fakePATs, now time.Time) *time.Time {
 	t.Helper()
 	oldLookup, oldNow, oldCache, oldFails, oldLimit, oldMax := patLookup, patNow, patCache, patFails, patFailLimit, patMaxAge
-	oldNoExpiry := patNoExpiryOwners
+	oldNoExpiry, oldAllow, oldDeny := patNoExpiryOwners, patAllowNoExpiry, patDenyOwners
 	clock := now
 	patNow = func() time.Time { return clock }
 	if f != nil {
@@ -42,10 +43,10 @@ func withPAT(t *testing.T, f *fakePATs, now time.Time) *time.Time {
 		patLookup = nil
 	}
 	patCache, patFails, patFailLimit, patMaxAge = newPATCache(), newPATFailCounter(), 10, 90*24*time.Hour
-	patNoExpiryOwners = map[string]bool{}
+	patNoExpiryOwners, patAllowNoExpiry, patDenyOwners = map[string]bool{}, false, nil
 	t.Cleanup(func() {
 		patLookup, patNow, patCache, patFails, patFailLimit, patMaxAge = oldLookup, oldNow, oldCache, oldFails, oldLimit, oldMax
-		patNoExpiryOwners = oldNoExpiry
+		patNoExpiryOwners, patAllowNoExpiry, patDenyOwners = oldNoExpiry, oldAllow, oldDeny
 	})
 	return &clock
 }
@@ -165,6 +166,57 @@ func TestCLINoExpiryOwners(t *testing.T) {
 				t.Errorf("result=%v, want %s", a["result"], c.result)
 			}
 		})
+	}
+}
+
+func TestCLIAllowNoExpiry(t *testing.T) {
+	now := time.Now()
+	past := now.Add(-time.Minute)
+	cases := []struct {
+		name, result string
+		owner        *patOwner
+	}{
+		{"any owner, no expiry", "ok", &patOwner{ID: "p", Email: "dev@example.com", CreatedOn: now, Verified: true}},
+		{"with expiry", "ok", goodOwner(now, 30)},
+		{"expired", "denied_pat_expired", &patOwner{ID: "p", Email: "dev@example.com", ExpiresOn: &past, CreatedOn: now.Add(-48 * time.Hour), Verified: true}},
+		{"no expiry, not verified", "denied_pat_owner", &patOwner{ID: "p", Email: "dev@example.com", CreatedOn: now, Verified: false}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("PROXYSCOTCH_ALLOW_LOOPBACK_TARGETS", "true")
+			withPAT(t, &fakePATs{owners: map[string]*patOwner{strings.TrimPrefix(testPATGood, "pat-"): c.owner}}, now)
+			patAllowNoExpiry = true
+			if a := cliCall(t, testPATGood, "10.0.0.9", nil); a["result"] != c.result {
+				t.Errorf("result=%v, want %s", a["result"], c.result)
+			}
+		})
+	}
+}
+
+func TestCLIDenyOwners(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name, result, user string
+		owner              *patOwner
+	}{
+		{"shared, no expiry", "denied_pat_shared", "DL_Team@example.com", &patOwner{ID: "p", Email: "DL_Team@example.com", CreatedOn: now, Verified: true}},
+		{"shared, with expiry", "denied_pat_shared", "dl_team@example.com", &patOwner{ID: "p", Email: "dl_team@example.com", ExpiresOn: goodOwner(now, 30).ExpiresOn, CreatedOn: now, Verified: true}},
+		{"personal", "ok", "dev@example.com", goodOwner(now, 30)},
+		{"dl_ not at the start", "ok", "handle_dl_x@example.com", &patOwner{ID: "p", Email: "handle_dl_x@example.com", CreatedOn: now, Verified: true}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("PROXYSCOTCH_ALLOW_LOOPBACK_TARGETS", "true")
+			withPAT(t, &fakePATs{owners: map[string]*patOwner{strings.TrimPrefix(testPATGood, "pat-"): c.owner}}, now)
+			patAllowNoExpiry, patDenyOwners = true, regexp.MustCompile(`^dl_`)
+			a := cliCall(t, testPATGood, "10.0.0.9", nil)
+			if a["result"] != c.result || a["user"] != c.user {
+				t.Errorf("result=%v user=%v, want %s %s", a["result"], a["user"], c.result, c.user)
+			}
+		})
+	}
+	if !strings.Contains(patDeniedBody("denied_pat_shared"), "shared account") {
+		t.Error("denied_pat_shared needs its own message")
 	}
 }
 

@@ -9,8 +9,10 @@ package libproxy
 //     Hoppscotch 는 PAT 를 평문으로 저장하므로, 테이블을 읽을 수 있는 role 이면 모든 PAT 를 읽을 수 있다.
 //     함수는 (pat_id, owner_email, expires_on, created_on, owner_verified) 한 행을 돌려주고, 없으면 행이 없다.
 //   - 만료가 없는 PAT, 발급부터 만료까지가 PROXYSCOTCH_PAT_MAX_DAYS 를 넘는 PAT, 만료된 PAT, 함수가 owner_verified=false 로
-//     돌려준 PAT 는 거부한다. 만료가 없는 PAT 는 주인 이메일이 PROXYSCOTCH_PAT_NO_EXPIRY_OWNERS(쉼표로 구분, 대소문자 무시)에
-//     있을 때만 받는다 - 사람이 주기적으로 다시 발급하기 어려운 CI 용 계정을 위한 예외다.
+//     돌려준 PAT 는 거부한다. 만료가 없는 PAT 는 PROXYSCOTCH_PAT_ALLOW_NO_EXPIRY=true 이면 누구의 것이든 받고, 아니면 주인 이메일이
+//     PROXYSCOTCH_PAT_NO_EXPIRY_OWNERS(쉼표로 구분, 대소문자 무시)에 있을 때만 받는다.
+//   - 주인 이메일(소문자)이 PROXYSCOTCH_PAT_DENY_OWNERS(정규식)에 맞는 PAT 는 거부한다 - 여럿이 함께 쓰는 공용 계정은
+//     누가 불렀는지 남지 않으므로, CI 도 사람마다 자기 계정의 PAT 를 쓰게 한다.
 //   - 조회 결과는 PAT 의 SHA-256 으로 짧게 캐시한다(찾음 30초, 없음 10초). 조회 오류는 캐시하지 않고 거부한다(닫힌 실패).
 //   - 출발지(hopp_src)마다 1분에 PROXYSCOTCH_PAT_FAIL_PER_MINUTE 번 넘게 없는 PAT 를 보내면 그 분이 끝날 때까지 조회 없이 거부한다.
 //   - Audit · SIEM 줄의 user 는 PAT 주인 이메일, user_id 는 pat:<PAT id> 다. 주인을 모르면 user 는 anonymous 다.
@@ -65,8 +67,12 @@ var (
 	patNow       = time.Now
 	patCache     = newPATCache()
 	patFails     = newPATFailCounter()
-	// 만료가 없는 PAT 를 받는 주인(소문자 이메일). 비어 있으면 만료가 없는 PAT 는 모두 거부한다.
+	// 만료가 없는 PAT 를 받는 주인(소문자 이메일). 비어 있고 patAllowNoExpiry 도 거짓이면 만료가 없는 PAT 는 모두 거부한다.
 	patNoExpiryOwners = map[string]bool{}
+	// 참이면 만료가 없는 PAT 를 주인과 관계없이 받는다.
+	patAllowNoExpiry = false
+	// 주인 이메일(소문자)이 맞으면 거부한다(공용 계정). nil 이면 거부하지 않는다.
+	patDenyOwners *regexp.Regexp
 )
 
 // parsePATOwners 는 쉼표로 구분한 이메일 목록을 소문자 집합으로 바꾼다. 빈 항목은 건너뛰고, @ 가 없는 항목은 오류다.
@@ -111,6 +117,20 @@ func initPATFromEnv() {
 		ErrorLogger.Fatalf("PROXYSCOTCH_PAT_NO_EXPIRY_OWNERS: %s", sanitizeLogInput(err.Error()))
 	}
 	patNoExpiryOwners = owners
+	if v := os.Getenv("PROXYSCOTCH_PAT_ALLOW_NO_EXPIRY"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			ErrorLogger.Fatalf("PROXYSCOTCH_PAT_ALLOW_NO_EXPIRY must be true or false, got %q", sanitizeLogInput(v))
+		}
+		patAllowNoExpiry = b
+	}
+	if v := os.Getenv("PROXYSCOTCH_PAT_DENY_OWNERS"); v != "" {
+		re, err := regexp.Compile(v)
+		if err != nil {
+			ErrorLogger.Fatalf("PROXYSCOTCH_PAT_DENY_OWNERS is not a valid regular expression: %s", sanitizeLogInput(err.Error()))
+		}
+		patDenyOwners = re
+	}
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		ErrorLogger.Fatalf("PROXYSCOTCH_PAT_DSN is invalid: %v", err)
@@ -120,8 +140,16 @@ func initPATFromEnv() {
 	db.SetMaxIdleConns(2)
 	db.SetConnMaxLifetime(10 * time.Minute)
 	patLookup = sqlPATLookup(db)
-	InfoLogger.Printf("CLI path %s enabled: Hoppscotch PAT up to %d days (%d owners may use PATs without expiry), %d unknown tokens per source per minute",
-		cliPath, int(patMaxAge/(24*time.Hour)), len(patNoExpiryOwners), patFailLimit)
+	noExpiry := fmt.Sprintf("%d owners may use PATs without expiry", len(patNoExpiryOwners))
+	if patAllowNoExpiry {
+		noExpiry = "PATs without expiry accepted"
+	}
+	deny := "no owners denied"
+	if patDenyOwners != nil {
+		deny = "owners matching " + strconv.Quote(patDenyOwners.String()) + " denied"
+	}
+	InfoLogger.Printf("CLI path %s enabled: Hoppscotch PAT up to %d days (%s, %s), %d unknown tokens per source per minute",
+		cliPath, int(patMaxAge/(24*time.Hour)), noExpiry, deny, patFailLimit)
 }
 
 func sqlPATLookup(db *sql.DB) patLookupFunc {
@@ -184,12 +212,15 @@ func checkPAT(ctx context.Context, a *auditRecord, token string) string {
 		return "denied_pat"
 	}
 	a.user, a.userID = owner.Email, "pat:"+owner.ID
+	if patDenyOwners != nil && patDenyOwners.MatchString(strings.ToLower(owner.Email)) {
+		return "denied_pat_shared"
+	}
 	switch {
 	case owner.Email == "" || !owner.Verified:
 		a.user = patAnonymousUser
 		return "denied_pat_owner"
 	case owner.ExpiresOn == nil:
-		if !patNoExpiryOwners[strings.ToLower(owner.Email)] {
+		if !patAllowNoExpiry && !patNoExpiryOwners[strings.ToLower(owner.Email)] {
 			return "denied_pat_no_expiry"
 		}
 	case !now.Before(*owner.ExpiresOn):
@@ -207,6 +238,8 @@ func patDeniedBody(result string) string {
 	switch result {
 	case "error_pat_lookup":
 		msg = "Could not verify the access token. Try again later."
+	case "denied_pat_shared":
+		msg = "This personal access token belongs to a shared account, which cannot use this path. Use a token made in your own account."
 	case "denied_pat_no_expiry":
 		msg = "This personal access token has no expiry. Create one with an expiry."
 	case "denied_pat_lifetime":
