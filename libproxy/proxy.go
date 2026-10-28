@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -379,6 +380,26 @@ const ErrorBodyInvalidRequest = "{\"success\": false, \"data\":{\"message\":\"(P
 const ErrorBodyProxyRequestFailed = "{\"success\": false, \"data\":{\"message\":\"(Proxy Error) Request failed.\"}}"
 const maxMemory = int64(32 << 20)
 
+// upstreamTimeout is how long a proxied request may take. Anything in front of
+// proxyscotch should wait longer than this, or it gives up first and the caller
+// never sees the error below.
+var upstreamTimeout = 30 * time.Second
+
+// proxyErrorBody is the body of a failed proxy request. It is built with
+// encoding/json because the message may carry error text, and Go errors quote
+// URLs (`Get "https://...": ...`), which would break a hand-written JSON string.
+func proxyErrorBody(message string) string {
+	var body struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Message string `json:"message"`
+		} `json:"data"`
+	}
+	body.Data.Message = "(Proxy Error) " + message
+	b, _ := json.Marshal(body)
+	return string(b)
+}
+
 func proxyHandler(response http.ResponseWriter, request *http.Request) {
 	atomic.AddUint64(&totalRequests, 1)
 	lastRequestTime = time.Now()
@@ -557,7 +578,7 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 	if err != nil {
 		atomic.AddUint64(&totalErrors, 1)
 		ErrorLogger.Printf("Invalid URL from %s: %v", clientIP, err)
-		_, writeErr := fmt.Fprintln(response, "{\"success\": false, \"data\":{\"message\":\"(Proxy Error) Invalid URL: "+err.Error()+"\"}}")
+		_, writeErr := fmt.Fprintln(response, proxyErrorBody("Invalid URL: "+err.Error()))
 		if writeErr != nil {
 			ErrorLogger.Printf("Failed to write error response: %v", writeErr)
 		}
@@ -684,7 +705,7 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 	}
 
 	var client = &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: upstreamTimeout,
 	}
 
 	DebugLogger.Printf("Sending proxied request to %s", logURL(proxyRequest.URL.String()))
@@ -695,7 +716,12 @@ func proxyHandler(response http.ResponseWriter, request *http.Request) {
 		atomic.AddUint64(&totalErrors, 1)
 		ErrorLogger.Printf("Failed to execute proxied request to %s: %v", logURL(proxyRequest.URL.String()), logErr(err))
 		audit.result = "upstream_error"
-		_, writeErr := fmt.Fprintln(response, "{\"success\": false, \"data\":{\"message\":\"(Proxy Error) Request failed: "+err.Error()+"\"}}")
+		message := "Request failed: " + err.Error()
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) && urlErr.Timeout() {
+			message = fmt.Sprintf("Request failed: target did not respond within %s", upstreamTimeout)
+		}
+		_, writeErr := fmt.Fprintln(response, proxyErrorBody(message))
 		if writeErr != nil {
 			ErrorLogger.Printf("Failed to write error response: %v", writeErr)
 		}

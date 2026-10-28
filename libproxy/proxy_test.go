@@ -556,3 +556,43 @@ func TestHeaderToArray(t *testing.T) {
 	assert.Equal(t, "application/json", result["content-type"])
 	assert.Equal(t, "value2", result["x-custom-header"])
 }
+
+// proxyError posts a request to the proxy and decodes its error body. The body
+// must be valid JSON even when the message carries error text with quotes.
+func proxyError(t *testing.T, req Request) string {
+	t.Helper()
+	marshal, err := json.Marshal(req)
+	assert.Nil(t, err)
+	request := httptest.NewRequest("POST", "/", bytes.NewReader(marshal))
+	request.Header.Set("Origin", "validorigin1.com")
+	recorder := httptest.NewRecorder()
+	proxyHandler(recorder, request)
+	var body struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Message string `json:"message"`
+		} `json:"data"`
+	}
+	assert.Nil(t, json.Unmarshal(recorder.Body.Bytes(), &body), "error body is not JSON: %s", recorder.Body.String())
+	assert.False(t, body.Success)
+	return body.Data.Message
+}
+
+func TestTimeoutErrorIsJSON(t *testing.T) {
+	defer func(d time.Duration) { upstreamTimeout = d }(upstreamTimeout)
+	upstreamTimeout = 200 * time.Millisecond
+	message := proxyError(t, Request{Url: testServerUrl + "/delay/2", Method: "GET"})
+	assert.Equal(t, "(Proxy Error) Request failed: target did not respond within 200ms", message)
+}
+
+func TestInvalidURLErrorIsJSON(t *testing.T) {
+	// url.Parse quotes the URL in its error: parse "http://[::1": missing ']' in host
+	message := proxyError(t, Request{Url: "http://[::1", Method: "GET"})
+	assert.Contains(t, message, `(Proxy Error) Invalid URL: parse "http://[::1"`)
+}
+
+func TestRequestFailedErrorIsJSON(t *testing.T) {
+	// Nothing listens on port 1. The error quotes the URL: Get "http://127.0.0.1:1/": dial tcp ...
+	message := proxyError(t, Request{Url: "http://127.0.0.1:1/", Method: "GET"})
+	assert.Contains(t, message, `(Proxy Error) Request failed: Get "http://127.0.0.1:1/"`)
+}
